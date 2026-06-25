@@ -3,8 +3,11 @@ package com.siteblocker.app;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.Uri;
 import android.net.VpnService;
 import android.os.Bundle;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -35,6 +38,9 @@ public class MainActivity extends AppCompatActivity {
         prefs = getSharedPreferences("siteblocker", MODE_PRIVATE);
         blockedSites = loadSites();
 
+        // Ask Samsung to not kill our VPN service
+        requestBatteryOptimizationExemption();
+
         RecyclerView rv = findViewById(R.id.recyclerView);
         rv.setLayoutManager(new LinearLayoutManager(this));
         adapter = new SiteAdapter(blockedSites);
@@ -58,6 +64,16 @@ public class MainActivity extends AppCompatActivity {
 
         // Change PIN button
         findViewById(R.id.btnChangePin).setOnClickListener(v -> showChangePinDialog());
+    }
+
+    /** Ask Samsung to exempt this app from battery optimization so VPN keeps running. */
+    private void requestBatteryOptimizationExemption() {
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        if (!pm.isIgnoringBatteryOptimizations(getPackageName())) {
+            Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+            intent.setData(Uri.parse("package:" + getPackageName()));
+            startActivity(intent);
+        }
     }
 
     private void startVpn() {

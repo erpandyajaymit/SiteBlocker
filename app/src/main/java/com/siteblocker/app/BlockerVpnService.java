@@ -3,147 +3,180 @@ package com.siteblocker.app;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.net.VpnService;
-import android.system.OsConstants;
 import android.os.ParcelFileDescriptor;
+import android.os.PowerManager;
 import android.util.Log;
 import org.json.JSONArray;
 import org.json.JSONException;
 import java.io.*;
 import java.net.*;
 import java.nio.ByteBuffer;
+import java.nio.channels.DatagramChannel;
 import java.util.HashSet;
 import java.util.Set;
 
-/**
- * Local VPN service. Reads DNS packets and drops queries for blocked sites.
- * No traffic leaves the device — everything is handled locally.
- */
 public class BlockerVpnService extends VpnService {
 
     public static final String ACTION_START = "START";
-    public static final String ACTION_STOP = "STOP";
-    private static final String TAG = "BlockerVPN";
-    private static final String CHANNEL_ID = "blocker_channel";
+    public static final String ACTION_STOP  = "STOP";
+    private static final String TAG         = "BlockerVPN";
+    private static final String CHANNEL_ID  = "blocker_channel";
 
     private ParcelFileDescriptor vpnInterface;
     private Thread vpnThread;
     private volatile boolean running = false;
+    private PowerManager.WakeLock wakeLock;  // Keeps CPU alive on Samsung
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null) return START_NOT_STICKY;
-
+        if (intent == null || ACTION_START.equals(intent.getAction())) {
+            startVpn();
+            return START_STICKY;
+        }
         if (ACTION_STOP.equals(intent.getAction())) {
             stopVpn();
             return START_NOT_STICKY;
-        }
-
-        if (ACTION_START.equals(intent.getAction())) {
-            startVpn();
         }
         return START_STICKY;
     }
 
     private void startVpn() {
+        // Clean up previous run
+        running = false;
+        if (vpnThread != null) vpnThread.interrupt();
+        try { if (vpnInterface != null) vpnInterface.close(); } catch (Exception ignored) {}
+        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+
         createNotificationChannel();
+
+        // Foreground notification — prevents Samsung from killing the service
+        PendingIntent pi = PendingIntent.getActivity(this, 0,
+                new Intent(this, MainActivity.class),
+                PendingIntent.FLAG_IMMUTABLE);
+
         Notification notif = new Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("Site Blocker Active")
-                .setContentText("Blocking is ON")
+                .setContentText("Blocking websites — tap to manage")
                 .setSmallIcon(android.R.drawable.ic_lock_lock)
+                .setContentIntent(pi)
+                .setOngoing(true)
                 .build();
+
         startForeground(1, notif);
 
-        // Build the VPN interface — only routes DNS traffic (port 53)
-        Builder builder = new Builder()
-                .setSession("SiteBlocker")
-                .addAddress("10.0.0.2", 32)
-                .addDnsServer("8.8.8.8")
-                .addRoute("8.8.8.8", 32)    // Only route DNS server traffic through VPN
-                .addRoute("8.8.4.4", 32)
-                .setMtu(1500)
-                .allowFamily(OsConstants.AF_INET);
+        // Wake lock keeps CPU running so service isn't suspended
+        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SiteBlocker:VpnLock");
+        wakeLock.acquire();
 
         try {
-            vpnInterface = builder.establish();
+            vpnInterface = new Builder()
+                    .setSession("SiteBlocker")
+                    .addAddress("10.0.0.2", 32)
+                    .addDnsServer("10.0.0.1")   // Our fake DNS handled locally
+                    .addRoute("10.0.0.1", 32)
+                    .setMtu(1500)
+                    .establish();
+
+            if (vpnInterface == null) {
+                Log.e(TAG, "VPN establish returned null — permission denied?");
+                stopSelf();
+                return;
+            }
         } catch (Exception e) {
-            Log.e(TAG, "VPN establish failed", e);
+            Log.e(TAG, "VPN establish failed: " + e.getMessage());
+            stopSelf();
             return;
         }
 
         running = true;
         vpnThread = new Thread(this::runVpnLoop, "VpnThread");
+        vpnThread.setDaemon(false);
         vpnThread.start();
+        Log.d(TAG, "VPN started successfully");
     }
 
     private void runVpnLoop() {
-        FileInputStream in = new FileInputStream(vpnInterface.getFileDescriptor());
+        FileInputStream  in  = new FileInputStream(vpnInterface.getFileDescriptor());
         FileOutputStream out = new FileOutputStream(vpnInterface.getFileDescriptor());
-
-        ByteBuffer packet = ByteBuffer.allocate(32767);
+        byte[] buf = new byte[32767];
 
         while (running) {
             try {
-                packet.clear();
-                int len = in.read(packet.array());
-                if (len <= 0) continue;
+                int len = in.read(buf);
+                if (len <= 0) { sleep(10); continue; }
 
-                packet.limit(len);
+                String domain = extractDnsDomain(buf, len);
+                if (domain == null) continue;
 
-                // Parse IP packet to get DNS query domain
-                String domain = extractDnsDomain(packet.array(), len);
-
-                if (domain != null && isBlocked(domain)) {
-                    // Drop packet — don't forward, don't reply.
-                    // Browser will get a timeout and show "site not reachable"
+                if (isBlocked(domain)) {
                     Log.d(TAG, "BLOCKED: " + domain);
-                    continue;
+                    // Send NXDOMAIN response so browser shows error immediately
+                    byte[] nxdomain = buildNxDomainResponse(buf, len);
+                    if (nxdomain != null) out.write(nxdomain);
+                } else {
+                    forwardDns(buf, len, out);
                 }
-
-                // Forward non-blocked DNS to real DNS server and return response
-                forwardDns(packet.array(), len, out);
-
             } catch (IOException e) {
-                if (running) Log.e(TAG, "VPN loop error", e);
+                if (running) Log.e(TAG, "Loop error: " + e.getMessage());
+                sleep(100);
+            } catch (Exception e) {
+                if (running) Log.e(TAG, "Unexpected error: " + e.getMessage());
+                sleep(100);
             }
         }
     }
 
     /**
-     * Forwards DNS packet to 8.8.8.8:53 via UDP and writes response back.
+     * Sends NXDOMAIN (domain not found) reply so browser fails fast instead of timing out.
      */
-    private void forwardDns(byte[] packetData, int len, FileOutputStream out) {
+    private byte[] buildNxDomainResponse(byte[] req, int len) {
         try {
-            // Extract DNS payload (skip IP header 20 bytes + UDP header 8 bytes)
-            int ipHeaderLen = (packetData[0] & 0x0F) * 4;
-            int dnsOffset = ipHeaderLen + 8;
-            int dnsLen = len - dnsOffset;
+            int ipHeaderLen = (req[0] & 0x0F) * 4;
+            int dnsOffset   = ipHeaderLen + 8;
+            int dnsLen      = len - dnsOffset;
+            if (dnsLen < 12) return null;
+
+            // Copy DNS query, set QR=1 (response) and RCODE=3 (NXDOMAIN)
+            byte[] dnsResp = new byte[dnsLen];
+            System.arraycopy(req, dnsOffset, dnsResp, 0, dnsLen);
+            dnsResp[2] = (byte) 0x81; // QR=1, Opcode=0, AA=0, TC=0, RD=1
+            dnsResp[3] = (byte) 0x83; // RA=1, RCODE=3 (NXDOMAIN)
+
+            return buildIpUdpPacket(req, ipHeaderLen, dnsResp, dnsLen);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Forwards DNS packet to 8.8.8.8 and returns the response. */
+    private void forwardDns(byte[] req, int len, FileOutputStream out) {
+        try {
+            int ipHeaderLen = (req[0] & 0x0F) * 4;
+            int dnsOffset   = ipHeaderLen + 8;
+            int dnsLen      = len - dnsOffset;
             if (dnsLen <= 0) return;
 
             byte[] dnsData = new byte[dnsLen];
-            System.arraycopy(packetData, dnsOffset, dnsData, 0, dnsLen);
+            System.arraycopy(req, dnsOffset, dnsData, 0, dnsLen);
 
-            // Send to real DNS
             DatagramSocket socket = new DatagramSocket();
-            protect(socket); // Allow this socket to bypass VPN
-            InetAddress dnsServer = InetAddress.getByName("8.8.8.8");
-            DatagramPacket send = new DatagramPacket(dnsData, dnsLen, dnsServer, 53);
-            socket.send(send);
+            protect(socket);  // Bypass VPN so we can reach real internet
+            socket.setSoTimeout(3000);
 
-            // Read response
+            InetAddress dns = InetAddress.getByName("8.8.8.8");
+            socket.send(new DatagramPacket(dnsData, dnsLen, dns, 53));
+
             byte[] resp = new byte[4096];
             DatagramPacket recv = new DatagramPacket(resp, resp.length);
-            socket.setSoTimeout(3000);
             socket.receive(recv);
             socket.close();
 
-            // Build response IP+UDP packet back to VPN interface
-            byte[] full = buildIpUdpPacket(
-                    packetData, ipHeaderLen,
-                    resp, recv.getLength()
-            );
+            byte[] full = buildIpUdpPacket(req, ipHeaderLen, resp, recv.getLength());
             if (full != null) out.write(full);
 
         } catch (Exception e) {
@@ -151,95 +184,73 @@ public class BlockerVpnService extends VpnService {
         }
     }
 
-    /**
-     * Builds a minimal IP+UDP packet wrapping the DNS response.
-     */
-    private byte[] buildIpUdpPacket(byte[] origPacket, int ipHeaderLen, byte[] dnsResp, int dnsRespLen) {
-        if (origPacket.length < ipHeaderLen + 8) return null;
-
-        int totalLen = 20 + 8 + dnsRespLen;
-        byte[] pkt = new byte[totalLen];
+    /** Wraps DNS response in IP+UDP packet to send back through VPN interface. */
+    private byte[] buildIpUdpPacket(byte[] orig, int ipHeaderLen, byte[] dnsResp, int dnsRespLen) {
+        if (orig.length < ipHeaderLen + 8) return null;
+        int total = 20 + 8 + dnsRespLen;
+        byte[] pkt = new byte[total];
 
         // IP header
-        pkt[0] = 0x45; // Version=4, IHL=5
-        pkt[1] = 0;
-        pkt[2] = (byte) ((totalLen >> 8) & 0xFF);
-        pkt[3] = (byte) (totalLen & 0xFF);
-        pkt[4] = origPacket[4]; pkt[5] = origPacket[5]; // ID
-        pkt[6] = 0; pkt[7] = 0; // Flags
-        pkt[8] = 64; // TTL
-        pkt[9] = 17; // Protocol UDP
-        // Swap src/dst IP from original packet
-        System.arraycopy(origPacket, 16, pkt, 12, 4); // dst -> src
-        System.arraycopy(origPacket, 12, pkt, 16, 4); // src -> dst
-        // IP checksum
+        pkt[0] = 0x45;
+        pkt[2] = (byte) ((total >> 8) & 0xFF);
+        pkt[3] = (byte) (total & 0xFF);
+        pkt[4] = orig[4]; pkt[5] = orig[5];
+        pkt[8] = 64; pkt[9] = 17;
+        System.arraycopy(orig, 16, pkt, 12, 4); // swap src/dst IP
+        System.arraycopy(orig, 12, pkt, 16, 4);
         setIpChecksum(pkt);
 
-        // UDP header
-        pkt[20] = origPacket[ipHeaderLen + 2]; pkt[21] = origPacket[ipHeaderLen + 3]; // dst port -> src
-        pkt[22] = origPacket[ipHeaderLen];     pkt[23] = origPacket[ipHeaderLen + 1]; // src port -> dst
+        // UDP header — swap ports
+        pkt[20] = orig[ipHeaderLen + 2]; pkt[21] = orig[ipHeaderLen + 3];
+        pkt[22] = orig[ipHeaderLen];     pkt[23] = orig[ipHeaderLen + 1];
         int udpLen = 8 + dnsRespLen;
         pkt[24] = (byte) ((udpLen >> 8) & 0xFF);
         pkt[25] = (byte) (udpLen & 0xFF);
-        pkt[26] = 0; pkt[27] = 0; // Checksum (optional for IPv4)
 
-        // DNS payload
         System.arraycopy(dnsResp, 0, pkt, 28, dnsRespLen);
         return pkt;
     }
 
-    private void setIpChecksum(byte[] hdr) {
-        hdr[10] = 0; hdr[11] = 0;
-        int sum = 0;
+    private void setIpChecksum(byte[] h) {
+        h[10] = 0; h[11] = 0;
+        int s = 0;
         for (int i = 0; i < 20; i += 2)
-            sum += ((hdr[i] & 0xFF) << 8) | (hdr[i + 1] & 0xFF);
-        while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
-        sum = ~sum;
-        hdr[10] = (byte) ((sum >> 8) & 0xFF);
-        hdr[11] = (byte) (sum & 0xFF);
+            s += ((h[i] & 0xFF) << 8) | (h[i + 1] & 0xFF);
+        while ((s >> 16) != 0) s = (s & 0xFFFF) + (s >> 16);
+        s = ~s;
+        h[10] = (byte) ((s >> 8) & 0xFF);
+        h[11] = (byte) (s & 0xFF);
     }
 
-    /**
-     * Extracts domain name from a DNS query packet.
-     * Returns null if not a DNS query or can't parse.
-     */
+    /** Parses DNS query packet and returns the queried domain name. */
     private String extractDnsDomain(byte[] data, int len) {
         try {
             int ipHeaderLen = (data[0] & 0x0F) * 4;
-            int protocol = data[9] & 0xFF;
-            if (protocol != 17) return null; // Not UDP
-
+            if (data[9] != 17) return null; // not UDP
             int dstPort = ((data[ipHeaderLen + 2] & 0xFF) << 8) | (data[ipHeaderLen + 3] & 0xFF);
-            if (dstPort != 53) return null; // Not DNS
+            if (dstPort != 53) return null; // not DNS
 
             int dnsOffset = ipHeaderLen + 8;
             if (len < dnsOffset + 12) return null;
+            // Check it's a query (QR bit = 0)
+            if ((data[dnsOffset + 2] & 0x80) != 0) return null;
 
-            int flags = ((data[dnsOffset + 2] & 0xFF) << 8) | (data[dnsOffset + 3] & 0xFF);
-            if ((flags & 0x8000) != 0) return null; // It's a response, not a query
-
-            // Parse question section — starts at dnsOffset + 12
             StringBuilder domain = new StringBuilder();
             int pos = dnsOffset + 12;
             while (pos < len) {
-                int labelLen = data[pos] & 0xFF;
+                int labelLen = data[pos++] & 0xFF;
                 if (labelLen == 0) break;
                 if (domain.length() > 0) domain.append(".");
-                pos++;
-                for (int i = 0; i < labelLen && pos < len; i++, pos++)
-                    domain.append((char) (data[pos] & 0xFF));
+                for (int i = 0; i < labelLen && pos < len; i++)
+                    domain.append((char) (data[pos++] & 0xFF));
             }
             return domain.length() > 0 ? domain.toString().toLowerCase() : null;
-
         } catch (Exception e) {
             return null;
         }
     }
 
-    /**
-     * Check if domain matches any blocked site.
-     * Handles subdomains: blocking "youtube.com" also blocks "www.youtube.com"
-     */
+    /** Checks if domain or any parent domain is in the block list. */
     private boolean isBlocked(String domain) {
         Set<String> blocked = getBlockedSites();
         if (blocked.contains(domain)) return true;
@@ -252,9 +263,8 @@ public class BlockerVpnService extends VpnService {
     private Set<String> getBlockedSites() {
         Set<String> set = new HashSet<>();
         SharedPreferences prefs = getSharedPreferences("siteblocker", MODE_PRIVATE);
-        String json = prefs.getString("blocked_sites", "[]");
         try {
-            JSONArray arr = new JSONArray(json);
+            JSONArray arr = new JSONArray(prefs.getString("blocked_sites", "[]"));
             for (int i = 0; i < arr.length(); i++) set.add(arr.getString(i));
         } catch (JSONException ignored) {}
         return set;
@@ -263,9 +273,8 @@ public class BlockerVpnService extends VpnService {
     private void stopVpn() {
         running = false;
         if (vpnThread != null) vpnThread.interrupt();
-        try {
-            if (vpnInterface != null) vpnInterface.close();
-        } catch (IOException ignored) {}
+        try { if (vpnInterface != null) vpnInterface.close(); } catch (Exception ignored) {}
+        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         stopForeground(true);
         stopSelf();
     }
@@ -274,11 +283,17 @@ public class BlockerVpnService extends VpnService {
     public void onDestroy() {
         super.onDestroy();
         running = false;
+        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
     }
 
     private void createNotificationChannel() {
         NotificationChannel ch = new NotificationChannel(
                 CHANNEL_ID, "Site Blocker", NotificationManager.IMPORTANCE_LOW);
+        ch.setDescription("Shows when site blocking is active");
         getSystemService(NotificationManager.class).createNotificationChannel(ch);
+    }
+
+    private void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException ignored) {}
     }
 }
